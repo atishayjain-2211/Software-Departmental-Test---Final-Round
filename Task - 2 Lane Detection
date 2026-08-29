@@ -1,1 +1,191 @@
+import argparse
+import cv2
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# 1. Edge detection
+# --------------------------------------------------------------------------- #
+def detect_edges(image):
+    """Convert to grayscale, smooth, and run Canny edge detection."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # A mild blur suppresses noise/texture from asphalt grain so that only
+    # strong, coherent edges (like painted lane markings and road borders)
+    # survive.
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Canny thresholds tuned to pick up lane-marking-strength edges without
+    # drowning in foliage/shadow texture.
+    edges = cv2.Canny(blurred, 50, 150)
+    return edges
+
+
+# --------------------------------------------------------------------------- #
+# 2. Region of interest
+# --------------------------------------------------------------------------- #
+def region_of_interest(edges):
+    """
+    Mask out everything except a trapezoid roughly covering the road ahead
+    of the vehicle (excludes sky, tree canopy, and the extreme left/right
+    edges of the frame where buildings/roadside objects live).
+    """
+    height, width = edges.shape
+    mask = np.zeros_like(edges)
+
+    polygon = np.array([[
+        (0, height),                                  # bottom-left
+        (int(0.30 * width), int(0.56 * height)),      # top-left
+        (int(0.66 * width), int(0.56 * height)),      # top-right
+        (width, height),                              # bottom-right
+    ]], dtype=np.int32)
+
+    cv2.fillPoly(mask, polygon, 255)
+    masked_edges = cv2.bitwise_and(edges, mask)
+    return masked_edges, polygon
+
+
+# --------------------------------------------------------------------------- #
+# 3. Hough transform line detection
+# --------------------------------------------------------------------------- #
+def detect_line_segments(masked_edges):
+    """Probabilistic Hough transform to extract candidate line segments."""
+    lines = cv2.HoughLinesP(
+        masked_edges,
+        rho=2,                # distance resolution in pixels
+        theta=np.pi / 180,    # angular resolution in radians
+        threshold=40,         # min votes (intersections) to be a line
+        minLineLength=30,     # discard short, noisy segments
+        maxLineGap=120,       # allow gaps in dashed lane markings
+    )
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# 4 & 5. Classify left/right and fit a single averaged line per side
+# --------------------------------------------------------------------------- #
+def average_slope_intercept(lines, height):
+    """
+    Separate raw Hough segments into left/right lane candidates by slope
+    sign, average their (slope, intercept) in a least-squares sense, and
+    return two line endpoints per side spanning from the bottom of the
+    image up to the top of the ROI.
+    """
+    left_fit = []
+    right_fit = []
+
+    if lines is None:
+        return None, None
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 == x1:
+            continue  # skip vertical lines (undefined slope)
+
+        slope, intercept = np.polyfit((x1, x2), (y1, y2), 1)
+
+        # Ignore near-horizontal segments (slope close to 0): these are
+        # typically crosswalks, shadows, or the horizon line, not lane
+        # boundaries.
+        if abs(slope) < 0.3:
+            continue
+
+        # In image coordinates, y increases downward.
+        # A left lane boundary rises to the right in screen space when
+        # viewed from the driver's seat on a road curving normally, which
+        # here corresponds to a NEGATIVE slope; the right boundary has a
+        # POSITIVE slope.
+        if slope < 0:
+            left_fit.append((slope, intercept))
+        else:
+            right_fit.append((slope, intercept))
+
+    y_bottom = height
+    y_top = int(height * 0.55)
+
+    def make_points(fit):
+        if len(fit) == 0:
+            return None
+        slope, intercept = np.average(fit, axis=0)
+        if abs(slope) < 1e-6:
+            return None
+        x_bottom = int((y_bottom - intercept) / slope)
+        x_top = int((y_top - intercept) / slope)
+        return (x_bottom, y_bottom, x_top, y_top)
+
+    return make_points(left_fit), make_points(right_fit)
+
+
+# --------------------------------------------------------------------------- #
+# 6. Draw lane lines + fill drivable-area polygon
+# --------------------------------------------------------------------------- #
+def draw_lane_overlay(image, left_line, right_line):
+    overlay = image.copy()
+    result = image.copy()
+
+    if left_line is not None and right_line is not None:
+        lx1, ly1, lx2, ly2 = left_line
+        rx1, ry1, rx2, ry2 = right_line
+
+        # Fill the quadrilateral between the two lane lines (the drivable
+        # area) with a translucent green.
+        drivable_polygon = np.array(
+            [[(lx1, ly1), (lx2, ly2), (rx2, ry2), (rx1, ry1)]], dtype=np.int32
+        )
+        cv2.fillPoly(overlay, drivable_polygon, (0, 200, 0))
+        result = cv2.addWeighted(overlay, 0.30, result, 0.70, 0)
+
+    # Draw the lane boundary lines themselves on top, in a bold color.
+    for line, color in ((left_line, (0, 0, 255)), (right_line, (255, 0, 0))):
+        if line is not None:
+            x1, y1, x2, y2 = line
+            cv2.line(result, (x1, y1), (x2, y2), color, 8)
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Full pipeline for a single frame/image
+# --------------------------------------------------------------------------- #
+def process_frame(image, draw_debug_roi=False):
+    height = image.shape[0]
+
+    edges = detect_edges(image)
+    masked_edges, roi_polygon = region_of_interest(edges)
+    lines = detect_line_segments(masked_edges)
+    left_line, right_line = average_slope_intercept(lines, height)
+    result = draw_lane_overlay(image, left_line, right_line)
+
+    if draw_debug_roi:
+        cv2.polylines(result, [roi_polygon], True, (0, 255, 255), 2)
+
+    return result, edges, masked_edges
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Detect lane boundaries and highlight drivable area.")
+    parser.add_argument("--input", required=True, help="Path to input road image.")
+    parser.add_argument("--output", required=True, help="Path to save the annotated output image.")
+    parser.add_argument("--debug", action="store_true", help="Also save intermediate edge-detection images.")
+    args = parser.parse_args()
+
+    image = cv2.imread(args.input)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image at {args.input}")
+
+    result, edges, masked_edges = process_frame(image, draw_debug_roi=args.debug)
+
+    cv2.imwrite(args.output, result)
+    print(f"Saved annotated result to {args.output}")
+
+    if args.debug:
+        base = args.output.rsplit(".", 1)[0]
+        cv2.imwrite(f"{base}_edges.png", edges)
+        cv2.imwrite(f"{base}_masked_edges.png", masked_edges)
+        print(f"Saved debug edge images alongside {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+
 
